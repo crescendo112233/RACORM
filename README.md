@@ -1,64 +1,108 @@
-# **Attention-Guided Contrastive Role Representations for Multi-agent Reinforcement Learning**
+# RACORM: Relation-aware ACORM / Idea 1
 
-Zican Hu, Zongzhang Zhang, Huaxiong Li, Chunlin Chen, Hongyu Ding, Zhi Wang*
+This folder contains complete files to add or replace in the official NJU-RL/ACORM repository. It is not a patch script. Copy these files into the same relative paths of your ACORM checkout.
 
-A link to our paper can be found on [Paper Link](https://openreview.net/forum?id=LWmuPfEYhH)
+## Files
 
-## **Overview**
+Modified files:
 
-![ACORM_QMIX](./ACORM_QMIX.jpg)
+- `ACORM_QMIX/main.py`
+- `ACORM_QMIX/run.py`
 
-## **Instructions**
+New files:
 
-ACORM tested on two benchmark tasks [SMAC ](https://github.com/oxwhirl/smac) and [GRF](https://github.com/google-research/football) based on two algorithm framework [QMIX](https://arxiv.org/abs/1803.11485) and [MAPPO](https://arxiv.org/abs/2103.01955).
+- `ACORM_QMIX/algorithm/relation_context.py`
+- `ACORM_QMIX/algorithm/racorm.py`
+- `run_racorm_mmm2.sh`
 
-## **Citation**
+## Usage
 
-Please cite our paper as:
-```tex
-@inproceedings{
-hu2024attentionguided,
-title={Attention-Guided Contrastive Role Representations for Multi-agent Reinforcement Learning},
-author={Zican Hu and Zongzhang Zhang and Huaxiong Li and Chunlin Chen and Hongyu Ding and Zhi Wang},
-booktitle={The Twelfth International Conference on Learning Representations},
-year={2024},
-url={https://openreview.net/forum?id=LWmuPfEYhH}
-}
+```bash
+git clone https://github.com/NJU-RL/ACORM.git
+cd ACORM
+cp -r /path/to/ACORM_RACORM_files/* .
+
+python ./ACORM_QMIX/main.py \
+  --algorithm RACORM \
+  --env_name MMM2 \
+  --cluster_num 3 \
+  --max_train_steps 3050000 \
+  --tb_log_dir /root/tf-logs
 ```
 
-## **experiment instructions**
+Start TensorBoard:
 
-### **Installation instructions**
-Download the Linux version 4.10 of StarCraft II from the Blizzard's [repository](https://github.com/Blizzard/s2client-proto#downloads). By default, the game is expected to be in `~/StarCraftII/` directory. 
-See `requirments.txt` file for more information about how to install the dependencies.
-```python
-conda create -n acorm python=3.9.16 -y
-conda activate acorm
-pip install -r requirements.txt
+```bash
+tensorboard --logdir /root/tf-logs --bind_all
 ```
 
-### Run an experiment
+## Core idea
 
-You can execute the following command to run ACORM based on QMIX with a map config, such as `MMM2`:
+Original ACORM uses K-means over agent embeddings to construct role-positive and role-negative pairs. RACORM keeps ACORM's role encoder and attention-guided mixing network, but replaces the main contrastive role supervision with relation-context-driven sampling:
 
-```python
-python ./ACORM_QMIX/main.py --algorithm ACORM --env_name MMM2 --cluster_num 3 --max_train_steps 3050000
+\[
+r_{ij} = g(e_i, e_j, |e_i-e_j|, e_i\odot e_j, s)
+\]
+
+\[
+R_i = \sum_{j\ne i}\alpha_{ij}r_{ij}
+\]
+
+\[
+\operatorname{sim}_R(i,k)=\cos(R_i,R_k)
+\]
+
+Pairs with high relation-context similarity are positives; pairs with low similarity are negatives. This makes the role contrastive signal more relation-aware rather than purely cluster-driven.
+
+## TensorBoard tags
+
+Events are written under `/root/tf-logs` by default. Important tags:
+
+- `eval/win_rate`
+- `eval/mean_episode_reward`
+- `train/epsilon`
+- `train/qmix_loss`
+- `train/relation_loss`
+- `train/relation_total_loss`
+- `train/legacy_kmeans_loss`
+- `train/relation_pos_frac`
+- `train/relation_neg_frac`
+- `train/relation_sim_mean`
+- `train/relation_sim_std`
+- `train/edge_entropy`
+- `train/edge_max`
+- `train/relation_sim_hist`
+- `pretrain/agent_embedding_loss`
+- `pretrain/recl_loss`
+
+## Recommended ablations
+
+Original ACORM:
+
+```bash
+python ./ACORM_QMIX/main.py --algorithm ACORM --env_name MMM2 --cluster_num 3 --tb_log_dir /root/tf-logs
 ```
-or you can execute the following command to run ACORM base on MAPPO with a map config, such as `corridor`
 
-```python
-python ./ACORM_MAPPO/main.py --algorithm ACORM --env_name corridor --cluster_num 3 --max_train_steps 5050000
+RACORM:
+
+```bash
+python ./ACORM_QMIX/main.py --algorithm RACORM --env_name MMM2 --cluster_num 3 --tb_log_dir /root/tf-logs
 ```
 
-All results will be stored in the `ACORM_QMIX or ACORM_MAPPO/results` folder. You can see the console output, config, and tensorboard logging in the `ACORM_QMIX or ACORM_MAPPO/results/tb_logs` folder.
+RACORM without global state in relation encoder:
 
-You can plot the curve with `seaborn`:
-
-```python
-python plot.py --algorithm 'ACORM_QMIX' or 'ACORM_MAPPO'
+```bash
+python ./ACORM_QMIX/main.py --algorithm RACORM --env_name MMM2 --relation_use_state false --tb_log_dir /root/tf-logs
 ```
 
-## License
+Sparse relation graph:
 
-Code licensed under the Apache License v2.0.
+```bash
+python ./ACORM_QMIX/main.py --algorithm RACORM --env_name MMM2 --relation_topk 2 --tb_log_dir /root/tf-logs
+```
 
+RACORM with weak legacy fallback:
+
+```bash
+python ./ACORM_QMIX/main.py --algorithm RACORM --env_name MMM2 --kmeans_loss_weight 0.1 --tb_log_dir /root/tf-logs
+```
