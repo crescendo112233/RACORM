@@ -75,23 +75,35 @@ if __name__ == '__main__':
     parser.add_argument("--relation_dim", type=int, default=64, help="Output dimension of each pairwise relation and ego relation context")
     parser.add_argument("--relation_lr", type=float, default=8e-4, help="Learning rate of the relation encoder")
     parser.add_argument("--relation_temperature", type=float, default=0.2, help="Temperature for relation-driven InfoNCE")
+    parser.add_argument("--relation_sampling_mode", type=str, default="rank", choices=["rank", "threshold", "hybrid"],
+                        help="How relation positives/negatives are mined: rank is the v3 default; threshold is v2 ablation")
+    parser.add_argument("--relation_pos_k", type=int, default=1,
+                        help="Top-k most relation-similar non-self agents used as positives in rank/hybrid mode")
+    parser.add_argument("--relation_neg_k", type=int, default=1,
+                        help="Bottom-k least relation-similar non-self agents used as negatives in rank/hybrid mode")
     parser.add_argument("--relation_pos_threshold", type=float, default=0.65,
-                        help="Relation-context similarity threshold for positive role pairs")
+                        help="Threshold-mode positive similarity threshold; used only when relation_sampling_mode is threshold/hybrid")
     parser.add_argument("--relation_neg_threshold", type=float, default=0.35,
-                        help="Relation-context similarity threshold for negative role pairs")
+                        help="Threshold-mode negative similarity threshold; used only when relation_sampling_mode is threshold")
     parser.add_argument("--relation_loss_weight", type=float, default=1.0, help="Weight of relation-driven role contrastive loss")
     parser.add_argument("--kmeans_loss_weight", type=float, default=0.0,
                         help="Optional legacy fallback loss weight; 0 disables the fallback by default")
     parser.add_argument("--relation_topk", type=int, default=0,
-                        help="Top-k neighbors for sparse relation attention; 0 keeps all neighbors")
+                        help="Post-MLP top-k neighbors for sparse relation attention; 0 keeps all candidate neighbors")
+    parser.add_argument("--relation_sparse_topk", type=int, default=0,
+                        help="Pre-MLP sparse candidate neighbors for efficient relation graph construction; 0 uses dense graph")
+    parser.add_argument("--relation_sparse_metric", type=str, default="cosine", choices=["cosine", "l2"],
+                        help="Cheap metric used for pre-MLP relation_sparse_topk candidate selection")
+    parser.add_argument("--relation_sparsify_before_mlp", type=str2bool, default=True,
+                        help="Whether relation_sparse_topk is applied before the pairwise MLP to reduce computation")
     parser.add_argument("--relation_use_state", type=str2bool, default=True,
                         help="Whether to use the global state in the pairwise relation encoder")
     parser.add_argument("--relation_mask_self", type=str2bool, default=True,
                         help="Whether to mask self edges in relation attention")
     parser.add_argument("--relation_fallback_neg_k", type=int, default=2,
-                        help="Bottom-k least similar non-self agents used as fallback negatives when thresholding yields no negatives")
+                        help="Threshold-mode fallback bottom-k negatives when thresholding yields no negatives; not used in rank mode")
     parser.add_argument("--relation_fallback_pos_k", type=int, default=1,
-                        help="Top-k most similar non-self agents used as fallback positives when thresholding yields no inter-agent positives")
+                        help="Threshold-mode fallback top-k positives when thresholding yields no inter-agent positives; not used in rank mode")
     parser.add_argument("--relation_dynamics_loss_weight", type=float, default=0.1,
                         help="Weight of differentiable relation dynamics prediction loss")
     parser.add_argument("--relation_dynamics_hidden_dim", type=int, default=128,

@@ -38,6 +38,10 @@ class RelationACORM_Agent(ACORM_Agent):
         self.relation_loss_weight = float(getattr(args, "relation_loss_weight", 1.0))
         self.kmeans_loss_weight = float(getattr(args, "kmeans_loss_weight", 0.0))
         self.relation_temperature = float(getattr(args, "relation_temperature", 0.2))
+        self.relation_sampling_mode = str(getattr(args, "relation_sampling_mode", "rank")).lower()
+        self.relation_pos_k = int(getattr(args, "relation_pos_k", 1))
+        self.relation_neg_k = int(getattr(args, "relation_neg_k", 1))
+        # Threshold parameters are retained for ablation modes only.
         self.relation_pos_threshold = float(getattr(args, "relation_pos_threshold", 0.65))
         self.relation_neg_threshold = float(getattr(args, "relation_neg_threshold", 0.35))
         self.relation_fallback_neg_k = int(getattr(args, "relation_fallback_neg_k", 2))
@@ -132,7 +136,7 @@ class RelationACORM_Agent(ACORM_Agent):
         pairs. RACORM uses learned relation-context similarity instead:
             R_i = Pool_j g(e_i, e_j, s)
             sim_R(i,k) = cosine(R_i, R_k)
-        High sim_R pairs are positives; low sim_R pairs are negatives. In v2,
+        TopK sim_R pairs are positives; BottomK sim_R pairs are negatives by default. In v2,
         the relation encoder is trained by a differentiable relation dynamics
         prediction loss:
             e_hat_i^{t+1} = D(e_i^t, R_i^t)
@@ -182,6 +186,9 @@ class RelationACORM_Agent(ACORM_Agent):
                 active_mask=active_t,
                 fallback_neg_k=self.relation_fallback_neg_k,
                 fallback_pos_k=self.relation_fallback_pos_k,
+                sampling_mode=self.relation_sampling_mode,
+                pos_k=self.relation_pos_k,
+                neg_k=self.relation_neg_k,
             )
 
             # Differentiable relation dynamics prediction. This is the component
@@ -210,6 +217,10 @@ class RelationACORM_Agent(ACORM_Agent):
 
             rel_metrics["edge_entropy"] = edge_entropy(rel.edge_weights).detach()
             rel_metrics["edge_max"] = rel.edge_weights.max(dim=-1)[0].mean().detach()
+            rel_metrics["relation_candidate_edge_frac"] = rel.candidate_edge_frac.detach()
+            rel_metrics["relation_effective_edge_count"] = rel.effective_edge_count.detach()
+            rel_metrics["relation_effective_edge_frac"] = rel.effective_edge_frac.detach()
+            rel_metrics["relation_sparse_topk"] = torch.tensor(float(getattr(self.args, "relation_sparse_topk", 0)), device=self.device)
             rel_metrics["relation_loss"] = relation_loss.detach()
             rel_metrics["relation_dynamics_loss"] = dynamics_loss.detach()
             rel_metrics["relation_total_step_loss"] = loss_t.detach()
