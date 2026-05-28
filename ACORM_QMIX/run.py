@@ -5,12 +5,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
-from smac.env import StarCraft2Env
 from tensorboardX import SummaryWriter
 
 from algorithm.acorm import ACORM_Agent
 from algorithm.racorm import RelationACORM_Agent
 from algorithm.vdn_qmix import VDN_QMIX
+from env_factory import make_env
 from util.replay_buffer import ReplayBuffer
 
 
@@ -23,12 +23,10 @@ class Runner:
         self.env_name = self.args.env_name
         self.seed = self.args.seed
 
-        # Set random seed.
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
 
-        # Create env.
-        self.env = StarCraft2Env(map_name=self.env_name, seed=self.seed)
+        self.env = make_env(self.args)
         self.env_info = self.env.get_env_info()
         self.args.N = self.env_info["n_agents"]
         self.args.obs_dim = self.env_info["obs_shape"]
@@ -36,11 +34,18 @@ class Runner:
         self.args.action_dim = self.env_info["n_actions"]
         self.args.episode_limit = self.env_info["episode_limit"]
 
+        print(f"env_backend={getattr(self.args, 'env_backend', 'smac')}")
+        print(f"env_name={self.env_name}")
         print("number of agents={}".format(self.args.N))
         print("obs_dim={}".format(self.args.obs_dim))
         print("state_dim={}".format(self.args.state_dim))
         print("action_dim={}".format(self.args.action_dim))
         print("episode_limit={}".format(self.args.episode_limit))
+        if getattr(self.args, 'env_backend', 'smac') == 'smacv2' and hasattr(self.env, 'get_capabilities'):
+            try:
+                print(f"smacv2_capabilities={self.env.get_capabilities()}")
+            except Exception:
+                pass
 
         self.save_path = args.save_path
         self.model_path = args.model_path
@@ -49,18 +54,18 @@ class Runner:
         os.makedirs(self.args.tb_log_dir, exist_ok=True)
 
         time_path = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_env_name = f"{getattr(self.args, 'env_backend', 'smac')}_{self.env_name}"
         self.writer = SummaryWriter(
             log_dir='{}/{}/{}/{}_seed_{}_{}'.format(
                 self.args.tb_log_dir,
                 self.args.algorithm,
-                self.env_name,
-                self.env_name,
+                log_env_name,
+                log_env_name,
                 self.seed,
                 time_path,
             )
         )
 
-        # Create N agents.
         if args.algorithm in ['QMIX', 'VDN']:
             self.agent_n = VDN_QMIX(self.args)
         elif args.algorithm == 'ACORM':
@@ -107,7 +112,7 @@ class Runner:
                     self.pretrain_recl_loss.append(recl_loss.item())
                     if self.args.tb_plot:
                         self.writer.add_scalar('pretrain/recl_loss', recl_loss.item(), global_step=self.recl_pretrain_epoch)
-                        self._write_train_metrics(getattr(self.agent_n, 'last_train_metrics', {}))
+                    self._write_train_metrics(getattr(self.agent_n, 'last_train_metrics', {}))
                 else:
                     self.total_steps += episode_steps
                     if self.replay_buffer.current_size >= self.args.batch_size:
@@ -120,7 +125,7 @@ class Runner:
         self.writer.close()
 
     def save_model(self):
-        model_path = f'{self.model_path}/{self.env_name}_seed{self.seed}_'
+        model_path = f'{self.model_path}/{getattr(self.args, "env_backend", "smac")}_{self.env_name}_seed{self.seed}_'
         torch.save(self.agent_n.eval_Q_net, model_path + 'q_net.pth')
         if hasattr(self.agent_n, 'RECL'):
             torch.save(self.agent_n.RECL.role_embedding_net, model_path + 'role_net.pth')
@@ -157,13 +162,12 @@ class Runner:
             if win_tag:
                 win_times += 1
             evaluate_reward += episode_reward
-
         win_rate = win_times / self.args.evaluate_times
         evaluate_reward = evaluate_reward / self.args.evaluate_times
         self.win_rates.append(win_rate)
         self.evaluate_reward.append(evaluate_reward)
-
         print("total_steps:{} \t win_rate:{} \t evaluate_reward:{}".format(self.total_steps, win_rate, evaluate_reward))
+
         if self.args.tb_plot:
             self.writer.add_scalar('eval/win_rate', win_rate, global_step=self.total_steps)
             self.writer.add_scalar('eval/mean_episode_reward', evaluate_reward, global_step=self.total_steps)
@@ -176,12 +180,11 @@ class Runner:
             sns.lineplot(x=x_step, y=np.array(self.win_rates).flatten(), label=self.args.algorithm)
             plt.ylabel('win_rates', fontsize=14)
             plt.xlabel(f'step*{self.args.evaluate_freq}', fontsize=14)
-            plt.title(f'{self.args.algorithm} on {self.env_name}')
-            plt.savefig(f'{self.save_path}/{self.env_name}_seed{self.seed}.jpg')
+            plt.title(f'{self.args.algorithm} on {getattr(self.args, "env_backend", "smac")}/{self.env_name}')
+            plt.savefig(f'{self.save_path}/{getattr(self.args, "env_backend", "smac")}_{self.env_name}_seed{self.seed}.jpg')
             plt.close()
-
-        np.save(f'{self.save_path}/{self.env_name}_seed{self.seed}.npy', np.array(self.win_rates))
-        np.save(f'{self.save_path}/{self.env_name}_seed{self.seed}_return.npy', np.array(self.evaluate_reward))
+            np.save(f'{self.save_path}/{getattr(self.args, "env_backend", "smac")}_{self.env_name}_seed{self.seed}.npy', np.array(self.win_rates))
+            np.save(f'{self.save_path}/{getattr(self.args, "env_backend", "smac")}_{self.env_name}_seed{self.seed}_return.npy', np.array(self.evaluate_reward))
 
     def run_episode_smac(self, evaluate=False):
         win_tag = False
@@ -190,8 +193,8 @@ class Runner:
         self.agent_n.eval_Q_net.rnn_hidden = None
         if self.args.algorithm in ROLE_ALGORITHMS:
             self.agent_n.RECL.agent_embedding_net.rnn_hidden = None
-
         last_onehot_a_n = np.zeros((self.args.N, self.args.action_dim))
+
         for episode_step in range(self.args.episode_limit):
             obs_n = self.env.get_obs()
             s = self.env.get_state()
@@ -209,17 +212,14 @@ class Runner:
             episode_reward += r
 
             if not evaluate:
-                # When dead/win/reaching the episode limit, done is True. We distinguish
-                # terminal dead/win from timeout; dw means dead or win with no true next state.
                 if done and episode_step + 1 != self.args.episode_limit:
                     dw = True
                 else:
                     dw = False
                 self.replay_buffer.store_transition(episode_step, obs_n, s, avail_a_n, last_onehot_a_n, a_n, r, dw)
-
-            last_onehot_a_n = np.eye(self.args.action_dim)[a_n]
-            if not evaluate:
+                last_onehot_a_n = np.eye(self.args.action_dim)[a_n]
                 self.epsilon = self.epsilon - self.args.epsilon_decay if self.epsilon - self.args.epsilon_decay > self.args.epsilon_min else self.args.epsilon_min
+
             if done:
                 break
 
