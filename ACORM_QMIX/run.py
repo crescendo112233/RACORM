@@ -84,6 +84,8 @@ class Runner:
         self.pretrain_agent_embed_loss, self.pretrain_recl_loss = [], []
         self.args.agent_embed_pretrain_epochs = 120
         self.args.recl_pretrain_epochs = 100
+        if getattr(self.agent_n, 'skip_recl_pretrain', False):
+            self.args.recl_pretrain_epochs = 0
 
     def run(self):
         evaluate_num = -1
@@ -202,7 +204,10 @@ class Runner:
             epsilon = 0 if evaluate else self.epsilon
 
             if self.args.algorithm in ROLE_ALGORITHMS:
-                role_embedding = self.agent_n.get_role_embedding(obs_n, last_onehot_a_n)
+                if self.args.algorithm == 'RACORM':
+                    role_embedding = self.agent_n.get_role_embedding(obs_n, last_onehot_a_n, s)
+                else:
+                    role_embedding = self.agent_n.get_role_embedding(obs_n, last_onehot_a_n)
                 a_n = self.agent_n.choose_action(obs_n, last_onehot_a_n, role_embedding, avail_a_n, epsilon)
             else:
                 a_n = self.agent_n.choose_action(obs_n, last_onehot_a_n, avail_a_n, epsilon)
@@ -217,9 +222,9 @@ class Runner:
                 else:
                     dw = False
                 self.replay_buffer.store_transition(episode_step, obs_n, s, avail_a_n, last_onehot_a_n, a_n, r, dw)
-                last_onehot_a_n = np.eye(self.args.action_dim)[a_n]
                 self.epsilon = self.epsilon - self.args.epsilon_decay if self.epsilon - self.args.epsilon_decay > self.args.epsilon_min else self.args.epsilon_min
 
+            last_onehot_a_n = np.eye(self.args.action_dim)[a_n]
             if done:
                 break
 

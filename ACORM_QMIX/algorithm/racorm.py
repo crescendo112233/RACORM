@@ -1,85 +1,193 @@
 """
-Relation-aware ACORM (RACORM) for the ACORM_QMIX codebase.
+Simple relation-conditioned RACORM / R2Role-QMIX.
 
-RACORM subclasses the original ACORM_Agent and replaces ACORM's K-means-based
-contrastive role supervision with relation-context-driven contrastive sampling.
-The value decomposition path is intentionally left compatible with ACORM's
-original attention mixer so that the main experimental difference is the role
-learning signal rather than another mixer change.
+This version intentionally removes the ACORM-style auxiliary machinery:
+    - no K-means role pair mining;
+    - no relation contrastive loss;
+    - no relation dynamics prediction loss;
+    - no ACORM state-to-role mixer attention by default.
 
-v2 changes:
-    1) positive/negative masks are mutually exclusive;
-    2) threshold-negative fallback uses bottom-k least similar non-self agents;
-    3) relation dynamics prediction is added so the relation encoder receives a
-       differentiable learning signal.
+The core hypothesis is tested directly:
+    role_i = f(agent_embedding_i, relation_context_i)
+
+Relation context R_i is computed by RelationContextEncoder from all agents'
+embeddings and the global state. This is a centralized diagnostic version and is
+not constrained to decentralized execution / strict CTDE.
 """
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
+import copy
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import StepLR
 
 from algorithm.acorm import ACORM_Agent
-from algorithm.relation_context import (
-    RelationContextEncoder,
-    RelationDynamicsPredictor,
-    edge_entropy,
-    relation_driven_infonce,
-)
+from algorithm.relation_context import RelationContextEncoder, edge_entropy
+
+
+class RelationRoleFusion(nn.Module):
+    """Fuse base ACORM role z_i with relation context R_i.
+
+    The default is a gated residual fusion:
+        r_i = W_R R_i
+        g_i = sigmoid(W_g [z_i, r_i])
+        z_i^rel = LN(z_i + lambda * g_i * r_i)
+
+    This keeps a safe fallback to the original ACORM role when relation context is
+    noisy: the gate can approach zero.
+    """
+
+    def __init__(self, role_dim: int, relation_dim: int):
+        super().__init__()
+        self.rel_proj = nn.Linear(relation_dim, role_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(role_dim * 2, role_dim),
+            nn.Sigmoid(),
+        )
+        self.norm = nn.LayerNorm(role_dim)
+
+    def forward(self, base_role: torch.Tensor, ego_context: torch.Tensor, inject_weight: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rel_role = self.rel_proj(ego_context)
+        gate = self.gate(torch.cat([base_role, rel_role], dim=-1))
+        fused_role = self.norm(base_role + float(inject_weight) * gate * rel_role)
+        return fused_role, gate, rel_role
 
 
 class RelationACORM_Agent(ACORM_Agent):
-    """ACORM with relation-context-driven role contrastive learning."""
+    """Direct relation-conditioned role variant.
+
+    This class keeps ACORM's trajectory encoder, role encoder, individual Q
+    network and QMIX training loop, but changes how roles are produced:
+        z_i = GatedFuse(ACORMRole(e_i), R_i)
+
+    It does not train RACORM's previous contrastive/dynamics objectives. The
+    relation encoder is trained directly through the TD loss because R_i enters
+    Q_i through z_i.
+    """
 
     def __init__(self, args):
         super().__init__(args)
-        self.relation_loss_weight = float(getattr(args, "relation_loss_weight", 1.0))
-        self.kmeans_loss_weight = float(getattr(args, "kmeans_loss_weight", 0.0))
-        self.relation_temperature = float(getattr(args, "relation_temperature", 0.2))
-        self.relation_sampling_mode = str(getattr(args, "relation_sampling_mode", "rank")).lower()
-        self.relation_pos_k = int(getattr(args, "relation_pos_k", 1))
-        self.relation_neg_k = int(getattr(args, "relation_neg_k", 1))
-        # Threshold parameters are retained for ablation modes only.
-        self.relation_pos_threshold = float(getattr(args, "relation_pos_threshold", 0.65))
-        self.relation_neg_threshold = float(getattr(args, "relation_neg_threshold", 0.35))
-        self.relation_fallback_neg_k = int(getattr(args, "relation_fallback_neg_k", 2))
-        self.relation_fallback_pos_k = int(getattr(args, "relation_fallback_pos_k", 1))
-        self.relation_dynamics_loss_weight = float(getattr(args, "relation_dynamics_loss_weight", 0.1))
+        self.use_relation_conditioned_role = bool(getattr(args, "use_relation_conditioned_role", True))
+        self.use_mixer_role_attention = bool(getattr(args, "use_mixer_role_attention", False))
+        self.relation_inject_weight = float(getattr(args, "relation_inject_weight", 0.2))
+        self.relation_inject_warmup_steps = int(getattr(args, "relation_inject_warmup_steps", 0))
+        self.skip_recl_pretrain = bool(getattr(args, "skip_recl_pretrain", True))
 
         self.relation_encoder = RelationContextEncoder(args).to(self.device)
-        self.relation_dynamics_predictor = RelationDynamicsPredictor(args).to(self.device)
-        self.relation_parameters = list(self.relation_encoder.parameters()) + list(self.relation_dynamics_predictor.parameters())
-        self.relation_optimizer = torch.optim.Adam(
-            self.relation_parameters,
-            lr=float(getattr(args, "relation_lr", self.recl_lr)),
+        self.relation_role_fusion = RelationRoleFusion(
+            role_dim=self.role_embedding_dim,
+            relation_dim=int(getattr(args, "relation_dim", self.role_embedding_dim)),
+        ).to(self.device)
+
+        # Rebuild the role-side optimiser so relation encoder and relation-role
+        # fusion are trained through L_TD together with the agent/role encoders.
+        base_role_params = list(self.RECL.role_embedding_net.parameters()) + list(self.RECL.agent_embedding_net.parameters())
+        relation_role_params = list(self.relation_encoder.parameters()) + list(self.relation_role_fusion.parameters())
+        self.role_parameters = base_role_params + relation_role_params
+        self.role_embedding_optimizer = torch.optim.Adam(
+            [
+                {"params": base_role_params, "lr": self.lr},
+                {"params": relation_role_params, "lr": float(getattr(args, "relation_lr", self.lr))},
+            ],
+            lr=self.lr,
         )
-        self.relation_lr_decay = StepLR(
-            self.relation_optimizer,
+        self.role_lr_decay = StepLR(
+            self.role_embedding_optimizer,
             step_size=self.lr_decay_steps,
             gamma=self.lr_decay_rate,
         )
         self.last_train_metrics: Dict[str, torch.Tensor] = {}
 
+    def _current_inject_weight(self) -> float:
+        if not self.use_relation_conditioned_role:
+            return 0.0
+        if self.relation_inject_warmup_steps <= 0:
+            return self.relation_inject_weight
+        # train_step is an update counter, not environment steps. This is enough
+        # for a soft warmup diagnostic and avoids coupling to Runner internals.
+        scale = min(1.0, float(self.train_step) / float(self.relation_inject_warmup_steps))
+        return self.relation_inject_weight * scale
+
+    def _fuse_roles(self, base_roles: torch.Tensor, ego_context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.use_relation_conditioned_role:
+            zeros = torch.zeros_like(base_roles)
+            return base_roles, zeros, zeros
+        return self.relation_role_fusion(base_roles, ego_context, self._current_inject_weight())
+
+    def _relation_metrics(self, rel, gate: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        metrics: Dict[str, torch.Tensor] = {
+            "relation_candidate_edge_frac": rel.candidate_edge_frac.detach().cpu(),
+            "relation_effective_edge_count": rel.effective_edge_count.detach().cpu(),
+            "relation_effective_edge_frac": rel.effective_edge_frac.detach().cpu(),
+            "edge_entropy": edge_entropy(rel.edge_weights).detach().cpu(),
+            "edge_max": rel.edge_weights.max(dim=-1)[0].mean().detach().cpu(),
+            "relation_sim_mean": rel.context_similarity.detach().mean().cpu(),
+            "relation_sim_std": rel.context_similarity.detach().std().cpu(),
+            "relation_sparse_topk": torch.tensor(float(getattr(self.args, "relation_sparse_topk", 0))),
+            "relation_inject_weight_current": torch.tensor(float(self._current_inject_weight())),
+            "mixer_role_attention_enabled": torch.tensor(float(self.use_mixer_role_attention)),
+        }
+        if gate is not None and gate.numel() > 0:
+            metrics["relation_gate_mean"] = gate.detach().mean().cpu()
+            metrics["relation_gate_std"] = gate.detach().std().cpu()
+            metrics["relation_gate_min"] = gate.detach().min().cpu()
+            metrics["relation_gate_max"] = gate.detach().max().cpu()
+        return metrics
+
+    def get_role_embedding(self, obs_n, last_a, state=None):
+        """Return relation-conditioned role embeddings for online action selection.
+
+        This method uses all agents' embeddings and optionally the global state;
+        therefore it is a centralized diagnostic version rather than strict CTDE.
+        """
+        recl_obs = torch.tensor(np.array(obs_n), dtype=torch.float32, device=self.device)
+        recl_last_a = torch.tensor(np.array(last_a), dtype=torch.float32, device=self.device)
+        agent_embedding = self.RECL.agent_embedding_forward(recl_obs, recl_last_a, detach=True)
+        base_role = self.RECL.role_embedding_forward(agent_embedding, detach=True, ema=False)
+
+        if not self.use_relation_conditioned_role:
+            return base_role
+
+        agent_embedding_b = agent_embedding.reshape(1, self.N, self.agent_embedding_dim)
+        if getattr(self.args, "relation_use_state", True):
+            if state is None:
+                # Keep the method robust for older callers. Zero state is not a
+                # scientific choice; Runner should pass the real state.
+                state_t = torch.zeros((1, self.state_dim), dtype=torch.float32, device=self.device)
+            else:
+                state_t = torch.tensor(np.array(state), dtype=torch.float32, device=self.device).reshape(1, self.state_dim)
+        else:
+            state_t = None
+        rel = self.relation_encoder(agent_embedding_b, state_t)
+        fused_role, _, _ = self._fuse_roles(base_role.reshape(1, self.N, self.role_embedding_dim), rel.ego_context)
+        return fused_role.reshape(self.N, self.role_embedding_dim)
+
+    def pretrain_recl(self, replay_buffer):
+        """No K-means/contrastive role pretraining in the simple direct version."""
+        zero = torch.tensor(0.0, device=self.device)
+        self.last_train_metrics = {
+            "pretrain/recl_loss_skipped": zero.detach().cpu(),
+        }
+        return zero
+
     def train(self, replay_buffer):
-        """Same high-level loop as ACORM_Agent.train, but returns TB metrics."""
         self.train_step += 1
         batch, max_episode_len = replay_buffer.sample(self.batch_size)
         inputs, batch_o, batch_s, batch_r, batch_a, batch_last_a, batch_avail_a_n, batch_active, batch_dw = self.get_inputs(batch)
 
-        metrics: Dict[str, torch.Tensor] = {}
-        if self.train_step % self.train_recl_freq == 0:
-            relation_metrics = self.update_recl(batch_o, batch_last_a, batch_s, batch_active, max_episode_len)
-            self.soft_update_params(self.RECL.role_embedding_net, self.RECL.role_embedding_target_net, self.role_tau)
-            metrics.update({f"train/{k}": v for k, v in relation_metrics.items()})
-
-        qmix_loss = self.update_qmix(
+        qmix_loss, aux_metrics = self.update_qmix(
             inputs, batch_o, batch_s, batch_r, batch_a, batch_last_a,
             batch_avail_a_n, batch_active, batch_dw, max_episode_len,
         )
+        metrics: Dict[str, torch.Tensor] = {}
         if qmix_loss is not None:
             metrics["train/qmix_loss"] = qmix_loss.detach().cpu()
+        for k, v in aux_metrics.items():
+            metrics[f"train/{k}"] = v
 
         if self.use_hard_update:
             if self.train_step % self.target_update_freq == 0:
@@ -93,192 +201,45 @@ class RelationACORM_Agent(ACORM_Agent):
         if self.use_lr_decay:
             self.qmix_lr_decay.step()
             self.role_lr_decay.step()
-            self.relation_lr_decay.step()
 
         self.last_train_metrics = metrics
         return metrics
 
-    def pretrain_recl(self, replay_buffer):
-        batch, max_episode_len = replay_buffer.sample(self.batch_size)
-        batch_o = batch['obs_n'].to(self.device)
-        batch_s = batch['s'].to(self.device)
-        batch_last_a = batch['last_onehot_a_n'].to(self.device)
-        batch_active = batch['active'].to(self.device)
-        relation_metrics = self.update_recl(batch_o, batch_last_a, batch_s, batch_active, max_episode_len)
-        self.soft_update_params(self.RECL.role_embedding_net, self.RECL.role_embedding_target_net, self.role_tau)
-        self.last_train_metrics = {f"pretrain/{k}": v for k, v in relation_metrics.items()}
-        return relation_metrics["relation_loss"]
+    def _compute_relation_conditioned_roles_batch(self, batch_o, batch_last_a, batch_s, max_episode_len):
+        """Compute z_i=f(e_i,R_i) for all t=0...T.
 
-    def _compute_agent_embedding_sequence(self, batch_o, batch_last_a, max_episode_len):
-        """Compute stop-gradient agent embeddings for t=0...T.
-
-        We compute the whole recurrent sequence once. This avoids corrupting the
-        GRU hidden state by calling the trajectory encoder twice for current and
-        next embeddings during relation dynamics prediction.
+        Returns:
+            agent_embeddings: (B, T+1, N, D_e)
+            role_embeddings:  (B, T+1, N, D_z)
+            metrics: averaged detached diagnostics for TensorBoard
         """
-        self.RECL.agent_embedding_net.rnn_hidden = None
-        embeddings = []
-        time_len = min(max_episode_len + 1, batch_o.shape[1], batch_last_a.shape[1])
-        with torch.no_grad():
-            for t in range(time_len):
-                emb_t = self.RECL.agent_embedding_forward(
-                    batch_o[:, t].reshape(-1, self.obs_dim),
-                    batch_last_a[:, t].reshape(-1, self.action_dim),
-                    detach=True,
-                ).reshape(batch_o.shape[0], self.N, self.agent_embedding_dim)
-                embeddings.append(emb_t.detach())
-        return embeddings
+        agent_embeddings, base_roles = self.RECL.batch_role_embed_forward(batch_o, batch_last_a, max_episode_len, detach=False)
+        bsz = batch_o.shape[0]
+        fused_roles = []
+        metrics_acc: Dict[str, list] = {}
 
-    def update_recl(self, batch_o, batch_last_a, batch_s, batch_active, max_episode_len):
-        """Relation-driven replacement of ACORM's K-means InfoNCE update.
+        for t in range(max_episode_len + 1):
+            rel = self.relation_encoder(agent_embeddings[:, t], batch_s[:, t])
+            fused_t, gate_t, _ = self._fuse_roles(base_roles[:, t], rel.ego_context)
+            fused_roles.append(fused_t)
+            step_metrics = self._relation_metrics(rel, gate_t)
+            for k, v in step_metrics.items():
+                metrics_acc.setdefault(k, []).append(v.float() if torch.is_tensor(v) else torch.tensor(float(v)))
 
-        ACORM uses K-means over agent embeddings to define positive/negative role
-        pairs. RACORM uses learned relation-context similarity instead:
-            R_i = Pool_j g(e_i, e_j, s)
-            sim_R(i,k) = cosine(R_i, R_k)
-        TopK sim_R pairs are positives; BottomK sim_R pairs are negatives by default. In v2,
-        the relation encoder is trained by a differentiable relation dynamics
-        prediction loss:
-            e_hat_i^{t+1} = D(e_i^t, R_i^t)
-            L_dyn = || e_hat_i^{t+1} - stopgrad(e_i^{t+1}) ||^2
-        """
-        agent_embeddings_seq = self._compute_agent_embedding_sequence(batch_o, batch_last_a, max_episode_len)
-        usable_steps = min(max_episode_len, len(agent_embeddings_seq) - 1)
-
-        total_loss = torch.tensor(0.0, device=self.device)
-        total_relation_loss = torch.tensor(0.0, device=self.device)
-        total_dynamics_loss = torch.tensor(0.0, device=self.device)
-        total_kmeans_loss = torch.tensor(0.0, device=self.device)
-        metric_acc = {}
-        valid_steps = 0
-
-        for t in range(usable_steps):
-            active_t = batch_active[:, t].view(-1)  # (B,)
-            if active_t.sum() <= 0.5:
-                continue
-
-            # Current and next agent embeddings are stop-gradient. The relation
-            # encoder still receives gradients through rel.ego_context in the
-            # dynamics predictor below.
-            agent_embedding = agent_embeddings_seq[t]
-            next_agent_embedding = agent_embeddings_seq[t + 1]
-
-            role_query = self.RECL.role_embedding_forward(
-                agent_embedding.reshape(-1, self.agent_embedding_dim),
-                detach=False,
-                ema=False,
-            ).reshape(-1, self.N, self.role_embedding_dim)
-            role_key = self.RECL.role_embedding_forward(
-                agent_embedding.reshape(-1, self.agent_embedding_dim),
-                detach=True,
-                ema=True,
-            ).reshape(-1, self.N, self.role_embedding_dim)
-
-            rel = self.relation_encoder(agent_embedding, batch_s[:, t])
-            relation_loss, rel_metrics = relation_driven_infonce(
-                role_query=role_query,
-                role_key=role_key,
-                bilinear_w=self.RECL.W,
-                relation_similarity=rel.context_similarity,
-                pos_threshold=self.relation_pos_threshold,
-                neg_threshold=self.relation_neg_threshold,
-                temperature=self.relation_temperature,
-                active_mask=active_t,
-                fallback_neg_k=self.relation_fallback_neg_k,
-                fallback_pos_k=self.relation_fallback_pos_k,
-                sampling_mode=self.relation_sampling_mode,
-                pos_k=self.relation_pos_k,
-                neg_k=self.relation_neg_k,
-            )
-
-            # Differentiable relation dynamics prediction. This is the component
-            # that makes relation_encoder trainable even though the contrastive
-            # masks are selected by non-differentiable threshold/top-k rules.
-            pred_next_embedding = self.relation_dynamics_predictor(agent_embedding, rel.ego_context)
-            dyn_error = F.mse_loss(pred_next_embedding, next_agent_embedding.detach(), reduction='none').mean(dim=-1)
-            dynamics_loss = (dyn_error * active_t.view(-1, 1).float()).sum() / (active_t.sum() * self.N + 1e-8)
-
-            # Optional fallback/ablation: retain original all-agent self-positive
-            # bilinear contrastive signal with K-means disabled by default.
-            kmeans_loss = torch.tensor(0.0, device=self.device)
-            if self.kmeans_loss_weight > 0:
-                kmeans_loss = self._legacy_kmeans_loss(role_query, role_key, agent_embedding, active_t)
-
-            loss_t = (
-                self.relation_loss_weight * relation_loss
-                + self.relation_dynamics_loss_weight * dynamics_loss
-                + self.kmeans_loss_weight * kmeans_loss
-            )
-            total_loss = total_loss + loss_t
-            total_relation_loss = total_relation_loss + relation_loss.detach()
-            total_dynamics_loss = total_dynamics_loss + dynamics_loss.detach()
-            total_kmeans_loss = total_kmeans_loss + kmeans_loss.detach()
-            valid_steps += 1
-
-            rel_metrics["edge_entropy"] = edge_entropy(rel.edge_weights).detach()
-            rel_metrics["edge_max"] = rel.edge_weights.max(dim=-1)[0].mean().detach()
-            rel_metrics["relation_candidate_edge_frac"] = rel.candidate_edge_frac.detach()
-            rel_metrics["relation_effective_edge_count"] = rel.effective_edge_count.detach()
-            rel_metrics["relation_effective_edge_frac"] = rel.effective_edge_frac.detach()
-            rel_metrics["relation_sparse_topk"] = torch.tensor(float(getattr(self.args, "relation_sparse_topk", 0)), device=self.device)
-            rel_metrics["relation_loss"] = relation_loss.detach()
-            rel_metrics["relation_dynamics_loss"] = dynamics_loss.detach()
-            rel_metrics["relation_total_step_loss"] = loss_t.detach()
-            for k, v in rel_metrics.items():
-                if k not in metric_acc:
-                    metric_acc[k] = []
-                metric_acc[k].append(v.detach().cpu() if torch.is_tensor(v) else v)
-
-        if valid_steps == 0:
-            return {
-                "relation_total_loss": torch.tensor(0.0),
-                "relation_loss": torch.tensor(0.0),
-                "relation_dynamics_loss": torch.tensor(0.0),
-            }
-
-        total_loss = total_loss / valid_steps
-        self.RECL_optimizer.zero_grad()
-        self.relation_optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.RECL.parameters(), 10)
-        torch.nn.utils.clip_grad_norm_(self.relation_parameters, 10)
-        self.RECL_optimizer.step()
-        self.relation_optimizer.step()
-
-        metrics = {
-            "relation_total_loss": total_loss.detach().cpu(),
-            "relation_loss": (total_relation_loss / valid_steps).detach().cpu(),
-            "relation_dynamics_loss": (total_dynamics_loss / valid_steps).detach().cpu(),
-            "legacy_kmeans_loss": (total_kmeans_loss / valid_steps).detach().cpu(),
-        }
-        for k, values in metric_acc.items():
-            # Histograms are kept as last-step vectors; scalars are averaged.
-            if k.endswith("_hist"):
-                metrics[k] = values[-1]
-            else:
-                vals = [v.float() if torch.is_tensor(v) else torch.tensor(float(v)) for v in values]
-                metrics[k] = torch.stack(vals).mean().detach().cpu()
-        return metrics
-
-    def _legacy_kmeans_loss(self, role_query, role_key, agent_embedding, active_t):
-        """Lightweight legacy fallback: self-positive denominator contrast.
-
-        The full original K-means branch remains in ACORM_Agent. This fallback is
-        intentionally simple and only used when --kmeans_loss_weight > 0.
-        """
-        logits = torch.matmul(torch.matmul(role_query, self.RECL.W), role_key.transpose(1, 2))
-        logits = logits - logits.max(dim=-1, keepdim=True)[0].detach()
-        labels = torch.arange(self.N, device=logits.device).view(1, self.N, 1).expand(logits.shape[0], -1, -1)
-        loss = F.cross_entropy(logits.reshape(-1, self.N), labels.reshape(-1), reduction="none")
-        loss = loss.view(logits.shape[0], self.N)
-        return (loss * active_t.view(-1, 1).float()).sum() / (active_t.sum() * self.N + 1e-8)
+        role_embeddings = torch.stack(fused_roles, dim=1).reshape(bsz, max_episode_len + 1, self.N, self.role_embedding_dim)
+        metrics = {k: torch.stack(v).mean().detach().cpu() for k, v in metrics_acc.items()}
+        return agent_embeddings, role_embeddings, metrics
 
     def update_qmix(self, inputs, batch_o, batch_s, batch_r, batch_a, batch_last_a, batch_avail_a_n, batch_active, batch_dw, max_episode_len):
-        """Copy of ACORM_Agent.update_qmix with loss returned for TensorBoard."""
+        """QMIX update with relation-conditioned roles and optional mixer MHA removal."""
         self.eval_Q_net.rnn_hidden = None
         self.target_Q_net.rnn_hidden = None
-        _, role_embeddings = self.RECL.batch_role_embed_forward(batch_o, batch_last_a, max_episode_len, detach=False)
+
+        _, role_embeddings, rel_metrics = self._compute_relation_conditioned_roles_batch(
+            batch_o, batch_last_a, batch_s, max_episode_len
+        )
         inputs = torch.cat([inputs, role_embeddings], dim=-1)
+
         q_evals, q_targets = [], []
         self.eval_mix_net.state_gru_hidden = None
         fc_batch_s = F.relu(self.eval_mix_net.state_fc(batch_s.reshape(-1, self.state_dim))).reshape(-1, max_episode_len + 1, self.state_dim)
@@ -312,10 +273,24 @@ class RelationACORM_Agent(ACORM_Agent):
             q_targets = torch.gather(q_targets, dim=-1, index=a_argmax).squeeze(-1)
 
         q_evals = torch.gather(q_evals, dim=-1, index=batch_a.unsqueeze(-1)).squeeze(-1)
-        role_embeddings = role_embeddings.reshape(-1, self.N, self.role_embedding_dim)
-        att_eval = self.eval_mix_net.attention_net(state_gru_outs, role_embeddings, role_embeddings).reshape(-1, max_episode_len + 1, self.N * self.att_out_dim)
-        with torch.no_grad():
-            att_target = self.target_mix_net.attention_net(state_gru_outs, role_embeddings, role_embeddings).reshape(-1, max_episode_len + 1, self.N * self.att_out_dim)
+        flat_roles = role_embeddings.reshape(-1, self.N, self.role_embedding_dim)
+
+        if self.use_mixer_role_attention:
+            att_eval = self.eval_mix_net.attention_net(state_gru_outs, flat_roles, flat_roles).reshape(
+                -1, max_episode_len + 1, self.N * self.att_out_dim
+            )
+            with torch.no_grad():
+                att_target = self.target_mix_net.attention_net(state_gru_outs, flat_roles, flat_roles).reshape(
+                    -1, max_episode_len + 1, self.N * self.att_out_dim
+                )
+        else:
+            # Remove ACORM's backend state-to-role attention. The existing mix
+            # network still expects an attention-sized input, so feed zeros. This
+            # removes the MHA computation and prevents the mixer from depending
+            # on another role-attention pathway.
+            att_shape = (self.batch_size, max_episode_len + 1, self.N * self.att_out_dim)
+            att_eval = batch_s.new_zeros(att_shape)
+            att_target = batch_s.new_zeros(att_shape)
 
         q_total_eval = self.eval_mix_net(q_evals, fc_batch_s[:, :-1], att_eval[:, :-1])
         q_total_target = self.target_mix_net(q_targets, fc_batch_s[:, 1:], att_target[:, 1:])
@@ -331,4 +306,8 @@ class RelationACORM_Agent(ACORM_Agent):
         torch.nn.utils.clip_grad_norm_(self.eval_parameters, 10)
         self.optimizer.step()
         self.role_embedding_optimizer.step()
-        return loss.detach()
+
+        rel_metrics["td_error_abs_mean"] = td_error.detach().abs().mean().cpu()
+        rel_metrics["q_total_eval_mean"] = q_total_eval.detach().mean().cpu()
+        rel_metrics["q_total_target_mean"] = q_total_target.detach().mean().cpu()
+        return loss.detach(), rel_metrics
